@@ -57,9 +57,7 @@ if __name__ == '__main__':
     env = gym.make('CartPole-v0')
 
     ### Stolen ###
-    goal_average_steps = 195
     max_number_of_steps = 201
-    last_time_steps = np.ndarray(0)
     n_bins = 8
     n_bins_angle = 10
 
