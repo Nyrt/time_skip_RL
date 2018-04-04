@@ -41,10 +41,6 @@ sess.run(tf.global_variables_initializer())
 
 
 
-
-
-
-
 env = gym.make('CartPole-v0')
 
 ### Stolen ###
