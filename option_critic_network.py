@@ -123,6 +123,7 @@ class Worker():
         self.local_AC = AC_Network(s_size,a_size,self.name,trainer)
         self.update_local_ops = update_target_graph('global',self.name)
         self.env = game
+        self.env.frameskip = 1
         self.actions = np.identity(a_size,dtype=bool).tolist()
         
     def train(self,rollout,sess,gamma,bootstrap_value):
