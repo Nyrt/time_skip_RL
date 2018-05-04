@@ -8,6 +8,8 @@ import scipy.signal
 # %matplotlib inline
 import gym
 import os
+from skimage.color import rgb2gray
+from skimage.transform import resize
 
 from random import choice
 from time import sleep
@@ -19,7 +21,7 @@ class AC_Network():
     def __init__(self,s_size, a_size, scope, trainer):
         with tf.variable_scope(scope):
             #Input and visual encoding layers
-            self.imageIn = tf.placeholder(shape=[None,s_size[0], s_size[1], s_size[2]],dtype=tf.float32)
+            self.imageIn = tf.placeholder(shape=[None,84, 84, 1],dtype=tf.float32)
             self.conv1 = slim.conv2d(activation_fn=tf.nn.elu,
                 inputs=self.imageIn,num_outputs=16,
                 kernel_size=[8,8],stride=[4,4],padding='VALID')
@@ -108,6 +110,9 @@ def normalized_columns_initializer(std=1.0):
         return tf.constant(out)
     return _initializer
 
+def process_frame(img):
+    return resize(rgb2gray(img), (110, 84))[18:110 - 8, :, None]
+
 class Worker():
     def __init__(self,game,name,s_size,a_size,trainer,model_path,global_episodes):
         self.name = "worker_" + str(name)
@@ -123,6 +128,7 @@ class Worker():
         self.local_AC = AC_Network(s_size,a_size,self.name,trainer)
         self.update_local_ops = update_target_graph('global',self.name)
         self.env = game
+        self.env.frameskip = 1
         self.actions = np.identity(a_size,dtype=bool).tolist()
         
     def train(self,rollout,sess,gamma,bootstrap_value):
@@ -174,7 +180,8 @@ class Worker():
                 episode_step_count = 0
                 d = False
                 
-                s = self.env.reset()
+                s = process_frame(self.env.reset())
+
                 episode_frames.append(s)
                 rnn_state = self.local_AC.state_init
                 self.batch_rnn_state = rnn_state
@@ -188,8 +195,11 @@ class Worker():
                     a = np.argmax(a_dist == a)
 
                     observation, r, d, info = self.env.step(self.actions[a])
+                    observation = process_frame(observation)
+                    #print observation.shape
+
                     if d == False:
-                        episode_frames.append(observation[:,:,:])
+                        episode_frames.append(observation[:,:])
                         
                     episode_buffer.append([s,a,r,observation,d,v[0,0]])
                     # print len(episode_buffer)
@@ -225,12 +235,12 @@ class Worker():
                                 
                     
                 # Periodically save gifs of episodes, model parameters, and summary statistics.
-                if episode_count % 5 == 0 and episode_count != 0:
+                if episode_count % 5 == 0:# and episode_count != 0:
                     if self.name == 'worker_0' and episode_count % 25 == 0:
                         time_per_step = 0.05
                         images = np.array(episode_frames)
                         make_gif(images,'./frames/image'+str(episode_count)+'.gif',
-                            duration=len(images)*time_per_step,true_image=True,salience=False)
+                            duration=len(images)*time_per_step,true_image=False,salience=False)
                     if episode_count % 250 == 0 and self.name == 'worker_0':
                         saver.save(sess,self.model_path+'/model-'+str(episode_count)+'.cptk')
                         print ("Saved Model")
@@ -264,11 +274,13 @@ def make_gif(images, fname, duration=2, true_image=False,salience=False,salIMGS=
       x = images[int(len(images)/duration*t)]
     except:
       x = images[-1]
+    x = np.concatenate([x, x, x], 2) # convert back to 3 channels
 
     if true_image:
       return x.astype(np.uint8)
     else:
       return ((x+1)/2*255).astype(np.uint8)
+
   
   def make_mask(t):
     try:
@@ -292,7 +304,7 @@ def make_gif(images, fname, duration=2, true_image=False,salience=False,salIMGS=
 
 
 if __name__ == '__main__':
-    environment = 'Breakout-v0'
+    environment = 'Breakout-v4'
 
     env = gym.make(environment)
     
@@ -301,7 +313,7 @@ if __name__ == '__main__':
 
     env = None
 
-    max_episode_length = 300
+    max_episode_length = 10000
     gamma = .99 # discount rate for advantage estimation and reward discounting
     model_path = './ac_model'
     load_model = False

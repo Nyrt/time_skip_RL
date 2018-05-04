@@ -8,6 +8,8 @@ import scipy.signal
 # %matplotlib inline
 import gym
 import os
+from skimage.color import rgb2gray
+from skimage.transform import resize
 
 from random import choice
 from time import sleep
@@ -19,7 +21,7 @@ class AC_Network():
     def __init__(self,s_size, a_size, scope, trainer):
         with tf.variable_scope(scope):
             #Input and visual encoding layers
-            self.imageIn = tf.placeholder(shape=[None,s_size[0], s_size[1], s_size[2]],dtype=tf.float32)
+            self.imageIn = tf.placeholder(shape=[None,84, 84, 1],dtype=tf.float32)
             self.conv1 = slim.conv2d(activation_fn=tf.nn.elu,
                 inputs=self.imageIn,num_outputs=16,
                 kernel_size=[8,8],stride=[4,4],padding='VALID')
@@ -51,6 +53,10 @@ class AC_Network():
                 activation_fn=tf.nn.softmax,
                 weights_initializer=normalized_columns_initializer(0.01),
                 biases_initializer=None)
+            self.duration = slim.fully_connected(rnn_out,1,
+                activation_fn=None,
+                weights_initializer=normalized_columns_initializer(1.0),
+                biases_initializer=None)
             self.value = slim.fully_connected(rnn_out,1,
                 activation_fn=None,
                 weights_initializer=normalized_columns_initializer(1.0),
@@ -66,10 +72,11 @@ class AC_Network():
                 self.responsible_outputs = tf.reduce_sum(self.policy * self.actions_onehot, [1])
 
                 #Loss functions
+                self.rep_loss = tf.reduce_sum(tf.clip_by_value(self.duration, 0, 20))
                 self.value_loss = 0.5 * tf.reduce_sum(tf.square(self.target_v - tf.reshape(self.value,[-1])))
                 self.entropy = - tf.reduce_sum(self.policy * tf.log(self.policy))
                 self.policy_loss = -tf.reduce_sum(tf.log(self.responsible_outputs)*self.advantages)
-                self.loss = 0.5 * self.value_loss + self.policy_loss - self.entropy * 0.01
+                self.loss = 0.5 * self.value_loss + self.policy_loss - self.entropy * 0.01 - self.duration
 
                 #Get gradients from local network using local losses
                 local_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope)
@@ -108,6 +115,9 @@ def normalized_columns_initializer(std=1.0):
         return tf.constant(out)
     return _initializer
 
+def process_frame(img):
+    return resize(rgb2gray(img), (110, 84))[18:110 - 8, :, None]
+
 class Worker():
     def __init__(self,game,name,s_size,a_size,trainer,model_path,global_episodes):
         self.name = "worker_" + str(name)
@@ -133,7 +143,9 @@ class Worker():
         rewards = rollout[:,2]
         next_observations = rollout[:,3]
         values = rollout[:,5]
-        
+        reps = rollout[:,6]
+
+        rewards *= reps
         # Here we take the rewards and values from the rollout, and use them to 
         # generate the advantage and discounted returns. 
         # The advantage function uses "Generalized Advantage Estimation"
@@ -151,15 +163,16 @@ class Worker():
             self.local_AC.advantages:advantages,
             self.local_AC.state_in[0]:self.batch_rnn_state[0],
             self.local_AC.state_in[1]:self.batch_rnn_state[1]}
-        v_l,p_l,e_l,g_n,v_n, self.batch_rnn_state,_ = sess.run([self.local_AC.value_loss,
+        v_l, p_l, e_l, g_n, v_n, self.batch_rnn_state, _, r_l = sess.run([self.local_AC.value_loss,
             self.local_AC.policy_loss,
             self.local_AC.entropy,
             self.local_AC.grad_norms,
             self.local_AC.var_norms,
             self.local_AC.state_out,
-            self.local_AC.apply_grads],
+            self.local_AC.apply_grads,
+            self.local_AC.rep_loss],
             feed_dict=feed_dict)
-        return v_l / len(rollout),p_l / len(rollout),e_l / len(rollout), g_n,v_n
+        return v_l / len(rollout),p_l / len(rollout),e_l / len(rollout), g_n, v_n, r_l
         
     def work(self,max_episode_length,gamma,sess,coord,saver):
         episode_count = sess.run(self.global_episodes)
@@ -175,46 +188,55 @@ class Worker():
                 episode_step_count = 0
                 d = False
                 
-                s = self.env.reset()
+                s = process_frame(self.env.reset())
+
                 episode_frames.append(s)
                 rnn_state = self.local_AC.state_init
                 self.batch_rnn_state = rnn_state
                 while d == False:
                     #Take an action using probabilities from policy network output.
-                    a_dist,v,rnn_state = sess.run([self.local_AC.policy,self.local_AC.value,self.local_AC.state_out], 
+                    a_dist,v,rnn_state, reps = sess.run([self.local_AC.policy,self.local_AC.value,self.local_AC.state_out, self.local_AC.duration], 
                         feed_dict={self.local_AC.imageIn:[s],
                         self.local_AC.state_in[0]:rnn_state[0],
                         self.local_AC.state_in[1]:rnn_state[1]})
-                    a = np.random.choice(a_dist[0],p=a_dist[0])
-                    a = np.argmax(a_dist == a)
 
-                    observation, r, d, info = self.env.step(self.actions[a])
-                    if d == False:
-                        episode_frames.append(observation[:,:,:])
+                    #print reps
+                    reps = np.clip(reps, 1, 20)
+                    for rep in xrange(reps):
+
+                        a = np.random.choice(a_dist[0],p=a_dist[0])
+                        a = np.argmax(a_dist == a)
+
+                        observation, r, d, info = self.env.step(self.actions[a])
+                        observation = process_frame(observation)
+                        #print observation.shape
+
+                        if d == False:
+                            episode_frames.append(observation[:,:])
+                            
+                        episode_buffer.append([s,a,r,observation,d,v[0,0],reps])
+                        # print len(episode_buffer)
+                        episode_values.append(v[0,0])
+
+                        episode_reward += r
+                        s = observation                    
+                        total_steps += 1
+                        episode_step_count += 1
                         
-                    episode_buffer.append([s,a,r,observation,d,v[0,0]])
-                    # print len(episode_buffer)
-                    episode_values.append(v[0,0])
-
-                    episode_reward += r
-                    s = observation                    
-                    total_steps += 1
-                    episode_step_count += 1
-                    
-                    # If the episode hasn't ended, but the experience buffer is full, then we
-                    # make an update step using that experience rollout.
-                    if len(episode_buffer) == 30 and d != True and episode_step_count != max_episode_length - 1:
-                        # Since we don't know what the true final return is, we "bootstrap" from our current
-                        # value estimation.
-                        v1 = sess.run(self.local_AC.value, 
-                            feed_dict={self.local_AC.imageIn:[s],
-                            self.local_AC.state_in[0]:rnn_state[0],
-                            self.local_AC.state_in[1]:rnn_state[1]})[0,0]
-                        v_l,p_l,e_l,g_n,v_n = self.train(episode_buffer,sess,gamma,v1)
-                        episode_buffer = []
-                        sess.run(self.update_local_ops)
-                    if d == True:
-                        break
+                        # If the episode hasn't ended, but the experience buffer is full, then we
+                        # make an update step using that experience rollout.
+                        if len(episode_buffer) == 30 and d != True and episode_step_count != max_episode_length - 1:
+                            # Since we don't know what the true final return is, we "bootstrap" from our current
+                            # value estimation.
+                            v1 = sess.run(self.local_AC.value, 
+                                feed_dict={self.local_AC.imageIn:[s],
+                                self.local_AC.state_in[0]:rnn_state[0],
+                                self.local_AC.state_in[1]:rnn_state[1]})[0,0]
+                            v_l,p_l,e_l,g_n,v_n,r_l = self.train(episode_buffer,sess,gamma,v1)
+                            episode_buffer = []
+                            sess.run(self.update_local_ops)
+                        if d == True:
+                            break
                                             
                 self.episode_rewards.append(episode_reward)
                 self.episode_lengths.append(episode_step_count)
@@ -222,16 +244,15 @@ class Worker():
                 
                 # Update the network using the episode buffer at the end of the episode.
                 if len(episode_buffer) != 0:
-                    v_l,p_l,e_l,g_n,v_n = self.train(episode_buffer,sess,gamma,0.0)
+                    v_l,p_l,e_l,g_n,v_n,r_l = self.train(episode_buffer,sess,gamma,0.0)
                                 
-                    
                 # Periodically save gifs of episodes, model parameters, and summary statistics.
-                if episode_count % 5 == 0 and episode_count != 0:
+                if episode_count % 5 == 0:# and episode_count != 0:
                     if self.name == 'worker_0' and episode_count % 25 == 0:
                         time_per_step = 0.05
                         images = np.array(episode_frames)
                         make_gif(images,'./frames/image'+str(episode_count)+'.gif',
-                            duration=len(images)*time_per_step,true_image=True,salience=False)
+                            duration=len(images)*time_per_step,true_image=False,salience=False)
                     if episode_count % 250 == 0 and self.name == 'worker_0':
                         saver.save(sess,self.model_path+'/model-'+str(episode_count)+'.cptk')
                         print ("Saved Model")
@@ -248,6 +269,7 @@ class Worker():
                     summary.value.add(tag='Losses/Entropy', simple_value=float(e_l))
                     summary.value.add(tag='Losses/Grad Norm', simple_value=float(g_n))
                     summary.value.add(tag='Losses/Var Norm', simple_value=float(v_n))
+                    summary.value.add(tag='Perf/reps', simple_value=float(r_l))
                     self.summary_writer.add_summary(summary, episode_count)
 
                     self.summary_writer.flush()
@@ -265,11 +287,13 @@ def make_gif(images, fname, duration=2, true_image=False,salience=False,salIMGS=
       x = images[int(len(images)/duration*t)]
     except:
       x = images[-1]
+    x = np.concatenate([x, x, x], 2) # convert back to 3 channels
 
     if true_image:
       return x.astype(np.uint8)
     else:
       return ((x+1)/2*255).astype(np.uint8)
+
   
   def make_mask(t):
     try:
@@ -293,7 +317,7 @@ def make_gif(images, fname, duration=2, true_image=False,salience=False,salIMGS=
 
 
 if __name__ == '__main__':
-    environment = 'Breakout-v0'
+    environment = 'Breakout-v4'
 
     env = gym.make(environment)
     
@@ -302,7 +326,7 @@ if __name__ == '__main__':
 
     env = None
 
-    max_episode_length = 300
+    max_episode_length = 10000
     gamma = .99 # discount rate for advantage estimation and reward discounting
     model_path = './ac_model'
     load_model = False
