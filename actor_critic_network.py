@@ -316,7 +316,7 @@ if __name__ == '__main__':
     max_episode_length = 10000
     gamma = .99 # discount rate for advantage estimation and reward discounting
     model_path = './ac_model'
-    load_model = False
+    load_model = True
 
     tf.reset_default_graph()
 
@@ -345,6 +345,7 @@ if __name__ == '__main__':
         if load_model == True:
             print ('Loading Model...')
             ckpt = tf.train.get_checkpoint_state(model_path)
+            print ckpt
             saver.restore(sess,ckpt.model_checkpoint_path)
         else:
             sess.run(tf.global_variables_initializer())
