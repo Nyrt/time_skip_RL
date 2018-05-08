@@ -42,14 +42,10 @@ sess.run(tf.global_variables_initializer())
 
 
 env = gym.make('CartPole-v0')
-
-### Stolen ###
 max_number_of_steps = 201
 
 number_of_features = env.observation_space.shape[0]
 last_time_steps = np.ndarray(0)
-
-### End stolen ###
 
 scores = []
 
